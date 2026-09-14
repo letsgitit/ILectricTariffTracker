@@ -1,0 +1,14 @@
+services:
+  tariff-tracker:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - tariff_data:/data
+    environment:
+      - TARIFF_CHECK_DAY=mon
+      - TARIFF_CHECK_HOUR=6
+    restart: unless-stopped
+
+volumes:
+  tariff_data:
