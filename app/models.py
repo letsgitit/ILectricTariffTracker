@@ -1,76 +1,68 @@
-"""Fetches a tracked document and returns its plain-text content.
+"""Database models for the tariff tracker.
 
-Two doc_types are supported:
-  - "pdf": download the PDF, extract text with pdfplumber
-  - "html_index": fetch the HTML page as text (used for index/landing pages
-    where we just want to notice the page changed, e.g. a new PDF got linked)
-
-Network errors, non-200 responses, and PDF-parse failures are caught and
-returned as a FetchResult with `.error` set rather than raised, so one bad
-document never takes down a scheduled run of the other documents.
+Three tables:
+  TrackedDocument - one row per tariff document we watch (seeded from config/tracked_documents.yaml)
+  Snapshot        - one row per successful fetch of a document, with a content hash and any
+                    parsed line-item values
+  ChangeEvent     - one row per detected change between two consecutive snapshots
 """
 from __future__ import annotations
 
-import hashlib
-import io
-from dataclasses import dataclass
-from typing import Optional
+import datetime as dt
 
-import requests
-
-USER_AGENT = (
-    "TariffTrackerBot/1.0 (+contact: set TARIFF_TRACKER_CONTACT env var; "
-    "fetches publicly posted utility tariff PDFs on a weekly schedule)"
+from sqlalchemy import (
+    Column, Integer, String, Text, DateTime, ForeignKey, JSON, Boolean
 )
-TIMEOUT_SECONDS = 30
+from sqlalchemy.orm import declarative_base, relationship
+
+Base = declarative_base()
 
 
-@dataclass
-class FetchResult:
-    text: str
-    content_hash: str
-    http_status: Optional[int]
-    error: Optional[str] = None
+class TrackedDocument(Base):
+    __tablename__ = "tracked_document"
 
+    id = Column(Integer, primary_key=True)
+    doc_key = Column(String, unique=True, nullable=False)  # e.g. "comed-rate-rds"
+    utility = Column(String, nullable=False)
+    rate_class = Column(String, nullable=False)
+    name = Column(String, nullable=False)
+    url = Column(String, nullable=False)
+    doc_type = Column(String, default="pdf")
+    notes = Column(Text, default="")
+    line_item_patterns = Column(JSON, default=list)  # [{"label": ..., "pattern": ...}]
+    active = Column(Boolean, default=True)
 
-def _hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
-
-
-def fetch_document(url: str, doc_type: str = "pdf") -> FetchResult:
-    headers = {"User-Agent": USER_AGENT}
-    try:
-        resp = requests.get(url, headers=headers, timeout=TIMEOUT_SECONDS)
-    except requests.RequestException as e:
-        return FetchResult(text="", content_hash="", http_status=None, error=str(e))
-
-    if resp.status_code != 200:
-        return FetchResult(
-            text="", content_hash="", http_status=resp.status_code,
-            error=f"HTTP {resp.status_code}",
-        )
-
-    if doc_type == "pdf":
-        try:
-            text = _extract_pdf_text(resp.content)
-        except Exception as e:  # pdfplumber can raise various parse errors
-            return FetchResult(
-                text="", content_hash="", http_status=resp.status_code,
-                error=f"PDF parse error: {e}",
-            )
-    else:
-        text = resp.text
-
-    return FetchResult(
-        text=text, content_hash=_hash(text), http_status=resp.status_code, error=None
+    snapshots = relationship(
+        "Snapshot", back_populates="document", order_by="Snapshot.fetched_at.desc()"
     )
 
+    def latest_snapshot(self):
+        return self.snapshots[0] if self.snapshots else None
 
-def _extract_pdf_text(pdf_bytes: bytes) -> str:
-    import pdfplumber
 
-    chunks = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            chunks.append(page.extract_text() or "")
-    return "\n".join(chunks)
+class Snapshot(Base):
+    __tablename__ = "snapshot"
+
+    id = Column(Integer, primary_key=True)
+    tracked_document_id = Column(Integer, ForeignKey("tracked_document.id"), nullable=False)
+    fetched_at = Column(DateTime, default=dt.datetime.utcnow)
+    content_hash = Column(String, nullable=False)
+    http_status = Column(Integer)
+    raw_text_excerpt = Column(Text)          # first ~5000 chars, for quick review
+    parsed_line_items = Column(JSON, default=dict)   # {label: value}
+    fetch_error = Column(Text, nullable=True)
+
+    document = relationship("TrackedDocument", back_populates="snapshots")
+
+
+class ChangeEvent(Base):
+    __tablename__ = "change_event"
+
+    id = Column(Integer, primary_key=True)
+    tracked_document_id = Column(Integer, ForeignKey("tracked_document.id"), nullable=False)
+    detected_at = Column(DateTime, default=dt.datetime.utcnow)
+    previous_snapshot_id = Column(Integer, ForeignKey("snapshot.id"), nullable=True)
+    new_snapshot_id = Column(Integer, ForeignKey("snapshot.id"), nullable=False)
+    change_type = Column(String)  # "content_hash" or "line_item"
+    summary = Column(Text)
+    line_item_diffs = Column(JSON, default=dict)  # {label: {"old": x, "new": y}}

@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import hashlib
 import io
+import re
+import unicodedata
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from typing import Optional
 
 import requests
@@ -35,6 +38,49 @@ class FetchResult:
 
 def _hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+_WS_RE = re.compile(r"\s+")
+
+
+def normalize_text(text: str) -> str:
+    """Canonical form used for hashing, so cosmetic differences between fetches
+    (whitespace/line-wrap changes, unicode variants) don't register as changes."""
+    return _WS_RE.sub(" ", unicodedata.normalize("NFKC", text)).strip()
+
+
+class _VisibleHTML(HTMLParser):
+    """Keeps visible text and link targets; drops scripts, styles and comments,
+    whose content (nonces, cache-busters, timestamps) changes on every load."""
+
+    def __init__(self):
+        super().__init__()
+        self.parts: list[str] = []
+        self.links: set[str] = set()
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip += 1
+        elif tag == "a":
+            href = dict(attrs).get("href")
+            if href:
+                self.links.add(href)
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style") and self._skip:
+            self._skip -= 1
+
+    def handle_data(self, data):
+        if not self._skip:
+            self.parts.append(data)
+
+
+def html_to_text(html: str) -> str:
+    parser = _VisibleHTML()
+    parser.feed(html)
+    # Links are sorted so reordering alone isn't a change; a new/removed link is.
+    return "\n".join(parser.parts + sorted(parser.links))
 
 
 def fetch_document(url: str, doc_type: str = "pdf") -> FetchResult:
@@ -59,10 +105,10 @@ def fetch_document(url: str, doc_type: str = "pdf") -> FetchResult:
                 error=f"PDF parse error: {e}",
             )
     else:
-        text = resp.text
+        text = html_to_text(resp.text)
 
     return FetchResult(
-        text=text, content_hash=_hash(text), http_status=resp.status_code, error=None
+        text=text, content_hash=_hash(normalize_text(text)), http_status=resp.status_code, error=None
     )
 
 
