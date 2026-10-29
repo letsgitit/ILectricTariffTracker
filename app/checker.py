@@ -37,7 +37,14 @@ def check_document(session: Session, doc: TrackedDocument) -> Snapshot:
     snapshot.raw_text_excerpt = result.text[:5000]
     snapshot.parsed_line_items = extract_line_items(result.text, doc.line_item_patterns)
 
-    previous = doc.latest_snapshot()  # most recent snapshot BEFORE this one is added
+    # Last *successful* snapshot: a failed fetch in between (hash "") must not
+    # hide a change that happened during the outage.
+    previous = (
+        session.query(Snapshot)
+        .filter(Snapshot.tracked_document_id == doc.id, Snapshot.content_hash != "")
+        .order_by(Snapshot.fetched_at.desc(), Snapshot.id.desc())
+        .first()
+    )
     session.add(snapshot)
     session.commit()  # commit so snapshot.id exists for the ChangeEvent FK
 
@@ -46,6 +53,12 @@ def check_document(session: Session, doc: TrackedDocument) -> Snapshot:
         if line_item_diffs:
             change_type = "line_item"
             summary = f"{len(line_item_diffs)} tracked line item(s) changed in {doc.name}"
+            lost = [k for k, v in line_item_diffs.items() if v["new"] is None]
+            if lost:
+                summary += (
+                    f" ({len(lost)} no longer matched — pattern may need updating "
+                    f"after a layout change)"
+                )
         else:
             change_type = "content_hash"
             summary = (
@@ -69,10 +82,13 @@ def check_document(session: Session, doc: TrackedDocument) -> Snapshot:
 
 
 def _diff_line_items(old: dict, new: dict) -> dict:
+    """Labels whose value differs between snapshots. A value appearing
+    (None -> x) or disappearing (x -> None, e.g. a pattern broken by a layout
+    change) counts as a difference; None -> None does not."""
     diffs = {}
-    for label, new_val in new.items():
-        old_val = old.get(label)
-        if new_val is not None and old_val is not None and str(new_val) != str(old_val):
+    for label in {**old, **new}:
+        old_val, new_val = old.get(label), new.get(label)
+        if old_val != new_val:
             diffs[label] = {"old": old_val, "new": new_val}
     return diffs
 
